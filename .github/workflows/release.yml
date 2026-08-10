@@ -1,0 +1,24 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build universal binary
+        run: |
+          swiftc -O -target arm64-apple-macos14 main.swift -o kilx-arm64
+          swiftc -O -target x86_64-apple-macos14 main.swift -o kilx-x86_64
+          lipo -create -output kilx kilx-arm64 kilx-x86_64
+
+      - name: Publish release
+        run: |
+          gh release create "$GITHUB_REF_NAME" 'kilx#kilx-universal' --generate-notes --title "$GITHUB_REF_NAME" \
+            || gh release upload "$GITHUB_REF_NAME" 'kilx#kilx-universal' --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}

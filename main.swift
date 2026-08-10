@@ -353,7 +353,60 @@ private let keyTapCallback: CGEventTapCallBack = { _, _, event, _ in
     return Unmanaged.passUnretained(event)
 }
 
+// MARK: - Armed cursor
+
+/// A skull cursor (the xkill pointer), drawn from the skull emoji.
+private func skullCursor() -> NSCursor {
+    let size = NSSize(width: 28, height: 28)
+    let image = NSImage(size: size)
+    image.lockFocus()
+    let str = NSAttributedString(string: "💀", attributes: [.font: NSFont.systemFont(ofSize: 24)])
+    let textSize = str.size()
+    str.draw(at: NSPoint(x: (size.width - textSize.width) / 2,
+                         y: (size.height - textSize.height) / 2))
+    image.unlockFocus()
+    return NSCursor(image: image, hotSpot: NSPoint(x: size.width / 2, y: size.height / 2))
+}
+
+/// Show the skull cursor over every display while armed: a transparent,
+/// click-through window at the top level whose cursor rect covers the whole
+/// screen, with the cursor re-asserted on a timer so it cannot go stale.
+private func showArmedCursor() {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.accessory) // no Dock icon
+    guard !NSScreen.screens.isEmpty else { return }
+    let frame = NSScreen.screens.map(\.frame).reduce(NSRect.null) { $0.union($1) }
+    let window = NSWindow(contentRect: frame, styleMask: [.borderless], backing: .buffered, defer: false)
+    window.level = .screenSaver
+    window.ignoresMouseEvents = true // clicks pass through to the event tap
+    window.backgroundColor = .clear
+    window.isOpaque = false
+    window.hasShadow = false
+    window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+    window.orderFrontRegardless()
+
+    let cursor = skullCursor()
+    // The window is topmost under the pointer, so re-asserting the cursor on a
+    // timer keeps the skull shown even though this app never becomes active.
+    Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in cursor.set() }
+}
+
 // MARK: - Main
+
+if CommandLine.arguments.contains(where: { $0 == "-h" || $0 == "--help" }) {
+    print("""
+    kilx — a macOS stand-in for X11's xkill.
+
+    Usage: kilx
+      After arming, click a window, menu bar / status item, or Dock icon to
+      terminate the app that owns it. Right-click or Esc cancels. One click
+      per run.
+
+    Requires Accessibility permission for the launching app
+    (System Settings → Privacy & Security → Accessibility).
+    """)
+    exit(0)
+}
 
 let trusted = AXIsProcessTrustedWithOptions(
     [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
@@ -405,4 +458,5 @@ if let keyTap = CGEvent.tapCreate(tap: .cgSessionEventTap,
     CGEvent.tapEnable(tap: keyTap, enable: true)
 }
 
+showArmedCursor()
 CFRunLoopRun()
