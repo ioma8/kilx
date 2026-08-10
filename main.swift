@@ -353,10 +353,10 @@ private let keyTapCallback: CGEventTapCallBack = { _, _, event, _ in
     return Unmanaged.passUnretained(event)
 }
 
-// MARK: - Armed cursor
+// MARK: - Armed feedback
 
-/// A skull cursor (the xkill pointer), drawn from the skull emoji.
-private func skullCursor() -> NSCursor {
+/// A skull image, drawn from the skull emoji.
+private func skullImage() -> NSImage {
     let size = NSSize(width: 28, height: 28)
     let image = NSImage(size: size)
     image.lockFocus()
@@ -365,18 +365,23 @@ private func skullCursor() -> NSCursor {
     str.draw(at: NSPoint(x: (size.width - textSize.width) / 2,
                          y: (size.height - textSize.height) / 2))
     image.unlockFocus()
-    return NSCursor(image: image, hotSpot: NSPoint(x: size.width / 2, y: size.height / 2))
+    return image
 }
 
-/// Show the skull cursor over every display while armed: a transparent,
-/// click-through window at the top level whose cursor rect covers the whole
-/// screen, with the cursor re-asserted on a timer so it cannot go stale.
-private func showArmedCursor() {
+/// A skull that follows the mouse while armed. The real cursor cannot be
+/// changed from a background process (cursor rects were removed from macOS),
+/// so a small click-through overlay tracks the pointer instead.
+private func showArmedFeedback() {
     let app = NSApplication.shared
     app.setActivationPolicy(.accessory) // no Dock icon
     guard !NSScreen.screens.isEmpty else { return }
-    let frame = NSScreen.screens.map(\.frame).reduce(NSRect.null) { $0.union($1) }
-    let window = NSWindow(contentRect: frame, styleMask: [.borderless], backing: .buffered, defer: false)
+
+    let skullSize: CGFloat = 36
+    let imageView = NSImageView(frame: NSRect(x: 0, y: 0, width: skullSize, height: skullSize))
+    imageView.image = skullImage()
+    let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: skullSize, height: skullSize),
+                          styleMask: [.borderless], backing: .buffered, defer: false)
+    window.contentView = imageView
     window.level = .screenSaver
     window.ignoresMouseEvents = true // clicks pass through to the event tap
     window.backgroundColor = .clear
@@ -385,10 +390,14 @@ private func showArmedCursor() {
     window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
     window.orderFrontRegardless()
 
-    let cursor = skullCursor()
-    // The window is topmost under the pointer, so re-asserting the cursor on a
-    // timer keeps the skull shown even though this app never becomes active.
-    Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in cursor.set() }
+    // CGEvent locations and AppKit screen coordinates are both top-left/bottom-
+    // left of the primary display, so the y flip is just the primary's height.
+    let primaryHeight = NSScreen.screens[0].frame.height
+    Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { _ in
+        let loc = CGEvent(source: nil)?.location ?? .zero
+        window.setFrameOrigin(NSPoint(x: loc.x - skullSize / 2,
+                                      y: primaryHeight - loc.y - skullSize / 2))
+    }
 }
 
 // MARK: - Main
@@ -458,5 +467,5 @@ if let keyTap = CGEvent.tapCreate(tap: .cgSessionEventTap,
     CGEvent.tapEnable(tap: keyTap, enable: true)
 }
 
-showArmedCursor()
+showArmedFeedback()
 CFRunLoopRun()
