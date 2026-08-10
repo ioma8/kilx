@@ -1,0 +1,378 @@
+// mkill — a macOS stand-in for X11's xkill.
+//
+// Usage:  ./mkill          (build with: swiftc -O main.swift -o mkill, or `make`)
+// After arming, click any window (or Dock icon) to terminate the app that
+// owns it. Right-click or Esc cancels. The click itself is consumed and never
+// reaches the target, just like xkill grabs the pointer. One click per run:
+// the tool exits after the first mouse-down whether or not it killed
+// anything, so a stray click can never take down a second app.
+//
+// Requires Accessibility permission for the app you launch it from
+// (System Settings → Privacy & Security → Accessibility). Esc additionally
+// needs Input Monitoring; if it is missing the tap simply isn't installed.
+
+import Cocoa
+import ApplicationServices
+import Carbon.HIToolbox
+
+// MARK: - Small helpers
+
+private func log(_ s: String) {
+    FileHandle.standardError.write(Data((s + "\n").utf8))
+}
+
+private func dbg(_ s: String) {
+    if ProcessInfo.processInfo.environment["MKILL_DEBUG"] != nil {
+        FileHandle.standardError.write(Data(("mkill: [dbg] " + s + "\n").utf8))
+    }
+}
+
+private let dockItemRole = "AXDockItem"
+
+private func axAttr(_ element: AXUIElement, _ attr: CFString) -> CFTypeRef? {
+    var value: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(element, attr, &value) == .success else { return nil }
+    return value
+}
+
+private func axRole(_ element: AXUIElement) -> String? {
+    axAttr(element, kAXRoleAttribute as CFString) as? String
+}
+
+private func axFrame(_ element: AXUIElement) -> CGRect? {
+    guard let posRef = axAttr(element, kAXPositionAttribute as CFString),
+          let sizeRef = axAttr(element, kAXSizeAttribute as CFString) else { return nil }
+    let pos = posRef as! AXValue
+    let size = sizeRef as! AXValue
+    var origin = CGPoint.zero
+    var extent = CGSize.zero
+    guard withUnsafeMutableBytes(of: &origin, { AXValueGetValue(pos, .cgPoint, $0.baseAddress!) }),
+          withUnsafeMutableBytes(of: &extent, { AXValueGetValue(size, .cgSize, $0.baseAddress!) }) else { return nil }
+    return CGRect(origin: origin, size: extent)
+}
+
+/// Walk up the accessibility tree to the owning application element,
+/// reporting whether a window appeared in the chain.
+private func resolveApp(from element: AXUIElement) -> (app: AXUIElement, sawWindow: Bool)? {
+    var current: AXUIElement? = element
+    var sawWindow = false
+    for _ in 0..<12 {
+        guard let cur = current else { return nil }
+        let role = axRole(cur)
+        if role == kAXApplicationRole as String { return (cur, sawWindow) }
+        if role == kAXWindowRole as String { sawWindow = true }
+        guard let parentRef = axAttr(cur, kAXParentAttribute as CFString) else { return nil }
+        current = (parentRef as! AXUIElement)
+    }
+    return nil
+}
+
+private var finderPID: pid_t {
+    NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.finder").first?.processIdentifier ?? 0
+}
+
+// MARK: - Dock
+
+private var dockPID: pid_t {
+    NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock").first?.processIdentifier ?? 0
+}
+
+/// Depth-first walk of the Dock's accessibility tree collecting AXDockItem elements.
+private func dockItemElements() -> [AXUIElement] {
+    let pid = dockPID
+    guard pid != 0 else { return [] }
+    var stack: [AXUIElement] = [AXUIElementCreateApplication(pid)]
+    var found: [AXUIElement] = []
+    var visited = 0
+    while let current = stack.popLast(), visited < 1000 {
+        visited += 1
+        if axRole(current) == dockItemRole { found.append(current) }
+        if let children = axAttr(current, kAXChildrenAttribute as CFString) as? [AXUIElement] {
+            stack.append(contentsOf: children)
+        }
+    }
+    return found
+}
+
+private func dockItemTitle(_ item: AXUIElement) -> String? {
+    axAttr(item, kAXTitleAttribute as CFString) as? String
+        ?? axAttr(item, kAXDescriptionAttribute as CFString) as? String
+}
+
+/// Item whose frame contains the point, preferring the innermost (smallest)
+/// frame; otherwise the icon whose center is close to the point.
+private func dockItem(at point: CGPoint, among items: [AXUIElement]) -> AXUIElement? {
+    let framed = items.compactMap { item -> (AXUIElement, CGRect)? in
+        guard let f = axFrame(item) else { return nil }
+        return (item, f)
+    }
+    let containing = framed.filter { $0.1.contains(point) }
+    if let best = containing.min(by: { $0.1.width * $0.1.height < $1.1.width * $1.1.height }) {
+        return best.0
+    }
+    return framed
+        .filter { hypot($0.1.midX - point.x, $0.1.midY - point.y) <= 70 }
+        .min { a, b in
+            hypot(a.1.midX - point.x, a.1.midY - point.y) < hypot(b.1.midX - point.x, b.1.midY - point.y)
+        }?.0
+}
+
+/// Is the click point inside the strip the Dock occupies on the primary
+/// display? Purely geometric (the bottom ~170 pt of the primary display, in
+/// the same top-left global coordinates as the click) so it stays reliable
+/// even while the Dock's accessibility tree is transiently unreadable during
+/// a reflow.
+private func inDockZone(_ p: CGPoint) -> Bool {
+    let b = CGDisplayBounds(CGMainDisplayID())
+    return p.x >= b.minX && p.x <= b.maxX
+        && p.y >= b.maxY - 170 && p.y <= b.maxY
+}
+
+private var dockVisible: Bool {
+    UserDefaults(suiteName: "com.apple.dock")?.bool(forKey: "autohide") != true
+}
+
+/// Resolve the Dock item under the cursor from the earliest consistent read:
+/// item frames and the system-wide hit test must agree within one read, and
+/// that result is used immediately. Re-resolving against a later (settled)
+/// layout would kill the app that now occupies the click point instead of the
+/// icon that was there when the user clicked. Returns nil if the Dock's tree
+/// stays unreadable or the two signals keep disagreeing.
+private func resolveDockItem(at point: CGPoint) -> AXUIElement? {
+    for _ in 0..<4 {
+        let items = dockItemElements()
+        let frameHit = dockItem(at: point, among: items)
+
+        var hit: AXUIElement?
+        let err = AXUIElementCopyElementAtPosition(AXUIElementCreateSystemWide(),
+                                                   Float(point.x), Float(point.y), &hit)
+        let hitItem = (err == .success && hit != nil && axRole(hit!) == dockItemRole) ? hit : nil
+
+        if let frameHit, let hitItem {
+            if CFEqual(frameHit, hitItem) { return frameHit } // consistent — trust it
+        } else if let resolved = frameHit ?? hitItem {
+            return resolved
+        }
+        usleep(120_000) // transient read failure — retry with fresher geometry
+    }
+    return nil
+}
+
+/// Kill the app behind the Dock icon under the cursor, or exit cleanly if the
+/// icon is not a running app or the Dock layout is unstable.
+private func killDockItem(at axPoint: CGPoint) -> Never {
+    guard let item = resolveDockItem(at: axPoint) else {
+        log("mkill: could not identify the dock app under the cursor (dock in flux?) — nothing killed.")
+        exit(1)
+    }
+    dbg("resolved dock item [\(dockItemTitle(item) ?? "?")]")
+    if let app = appForDockItem(item) {
+        dbg("matched running app [\(app.localizedName ?? "?")] pid \(app.processIdentifier)")
+        killApp(pid: app.processIdentifier, name: app.localizedName ?? "app")
+    }
+    log("mkill: dock item \"\(dockItemTitle(item) ?? "?")\" is not a running app (folder/stack/trash?) — nothing killed.")
+    exit(1)
+}
+
+/// Match a dock item's title to a running app, ignoring case and
+/// punctuation: the dock title "ChatGPT (Classic)" must match the app's
+/// localizedName "ChatGPT Classic".
+private func normalizedName(_ s: String) -> String {
+    s.lowercased().filter { $0.isLetter || $0.isNumber }
+}
+
+private func runningApp(named name: String) -> NSRunningApplication? {
+    let wanted = normalizedName(name)
+    guard !wanted.isEmpty else { return nil }
+    return NSWorkspace.shared.runningApplications.first {
+        normalizedName($0.localizedName ?? "") == wanted
+    }
+}
+
+private func appForDockItem(_ item: AXUIElement) -> NSRunningApplication? {
+    if let title = dockItemTitle(item), let app = runningApp(named: title) { return app }
+    if let desc = axAttr(item, kAXDescriptionAttribute as CFString) as? String,
+       let app = runningApp(named: desc) { return app }
+    return nil
+}
+
+// MARK: - Fallback: top-most window under the cursor
+
+private func windowOwnerPID(at point: CGPoint) -> pid_t? {
+    guard let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+            as? [[String: Any]] else { return nil }
+    var best: (pid: pid_t, layer: Int)?
+    for w in windows {
+        guard let pid = w[kCGWindowOwnerPID as String] as? pid_t,
+              let layer = w[kCGWindowLayer as String] as? Int,
+              let b = w[kCGWindowBounds as String] as? [String: CGFloat],
+              let x = b["X"], let y = b["Y"], let wd = b["Width"], let ht = b["Height"] else { continue }
+        if CGRect(x: x, y: y, width: wd, height: ht).contains(point),
+           best == nil || abs(layer) < abs(best!.layer) {
+            best = (pid, layer)
+        }
+    }
+    return best?.pid
+}
+
+// MARK: - Kill
+
+private func killApp(pid: pid_t, name: String) -> Never {
+    log("mkill: killing \(name) (pid \(pid))")
+    if let app = NSRunningApplication(processIdentifier: pid) {
+        app.terminate() // graceful quit; lets the app save its state
+        for _ in 0..<30 { // wait up to 6 s, then force
+            if app.isTerminated {
+                log("mkill: \(name) terminated.")
+                exit(0)
+            }
+            usleep(200_000)
+        }
+        log("mkill: \(name) did not quit in time; forcing…")
+        app.forceTerminate()
+        exit(0)
+    }
+    guard Darwin.kill(pid, SIGKILL) == 0 else {
+        log("mkill: could not terminate pid \(pid) (errno \(errno)).")
+        exit(1)
+    }
+    exit(0)
+}
+
+// MARK: - Click handling
+
+private func handleClick(at eventPoint: CGPoint, isRightClick: Bool) {
+    if isRightClick {
+        log("mkill: cancelled.")
+        exit(0)
+    }
+
+    // CGEvent locations and accessibility coordinates share the global display
+    // coordinate space (origin at the top-left of the main display), so the
+    // click point is used as-is. Flipping it here mirrored every real click
+    // vertically — dock clicks resolved on the menu bar of the frontmost app.
+    let axPoint = eventPoint
+
+    // 1) Accessibility hit test — the Dock's own hit testing decides whether
+    //    the click is on an icon, the dock bar, a window, or the menu bar.
+    let systemWide = AXUIElementCreateSystemWide()
+    var hit: AXUIElement?
+    var hitIsItem = false
+    var hitPID: pid_t = 0
+    var sawWindow = false
+    if AXUIElementCopyElementAtPosition(systemWide, Float(axPoint.x), Float(axPoint.y), &hit) == .success,
+       let hit {
+        hitIsItem = axRole(hit) == dockItemRole
+        if let resolved = resolveApp(from: hit) {
+            AXUIElementGetPid(resolved.app, &hitPID)
+            sawWindow = resolved.sawWindow
+        }
+    }
+
+    // 2) Dock click: the hit test says Dock, or the point lies in the Dock's
+    //    geometric zone on the primary display. The zone is tree-independent,
+    //    so a click during a Dock reflow (when its accessibility tree may be
+    //    transiently unreadable) can never fall through to the window path and
+    //    kill the app whose window runs underneath the Dock bar.
+    dbg("click \(eventPoint) ax \(axPoint) hitIsItem=\(hitIsItem) hitPID=\(hitPID) dockZone=\(inDockZone(eventPoint)) dockVisible=\(dockVisible)")
+    if hitIsItem || hitPID == dockPID || (dockVisible && inDockZone(eventPoint)) {
+        killDockItem(at: axPoint)
+    }
+
+    // 3) Window / menu bar / desktop click.
+    if hitPID != 0 {
+        if hitPID == finderPID && !sawWindow {
+            log("mkill: clicked the desktop — nothing killed.")
+            exit(1)
+        }
+        let name = NSRunningApplication(processIdentifier: hitPID)?.localizedName ?? "pid \(hitPID)"
+        killApp(pid: hitPID, name: name)
+    }
+
+    // 4) Fallback: top-most window under the cursor, for apps that do not
+    //    expose accessibility. Dock clicks never reach this point: a window
+    //    whose frame runs underneath the dock bar must not win a dock click.
+    if let pid = windowOwnerPID(at: eventPoint) {
+        let name = NSRunningApplication(processIdentifier: pid)?.localizedName ?? "pid \(pid)"
+        killApp(pid: pid, name: name)
+    }
+
+    log("mkill: nothing found under the cursor — nothing killed.")
+    exit(1)
+}
+
+// MARK: - Event taps
+
+private let mouseTapCallback: CGEventTapCallBack = { _, type, event, _ in
+    switch type {
+    case .leftMouseDown:
+        handleClick(at: event.location, isRightClick: false)
+    case .rightMouseDown:
+        handleClick(at: event.location, isRightClick: true)
+    default:
+        break
+    }
+    return nil // consume the click, xkill-style: the target never sees it
+}
+
+private let keyTapCallback: CGEventTapCallBack = { _, _, event, _ in
+    if event.getIntegerValueField(.keyboardEventKeycode) == Int64(kVK_Escape) {
+        log("mkill: cancelled.")
+        exit(0)
+    }
+    return Unmanaged.passUnretained(event)
+}
+
+// MARK: - Main
+
+let trusted = AXIsProcessTrustedWithOptions(
+    [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+)
+guard trusted else {
+    log("mkill: Accessibility permission required. Grant it to the app you launch this from")
+    log("       (System Settings → Privacy & Security → Accessibility), then run again.")
+    exit(1)
+}
+
+// Refuse to run a second armed instance: a stale one left waiting for a click
+// would silently consume the next mouse-down instead of the fresh instance.
+let lockPath = "/tmp/mkill.pid"
+if let existing = try? String(contentsOfFile: lockPath, encoding: .utf8)
+    .trimmingCharacters(in: .whitespacesAndNewlines),
+   let pid = pid_t(existing), pid != getpid(), Darwin.kill(pid, 0) == 0 {
+    log("mkill: another instance is already armed (pid \(pid)) — use it or kill it, then run again.")
+    exit(1)
+}
+try? String(getpid()).write(toFile: lockPath, atomically: true, encoding: .utf8)
+atexit { try? FileManager.default.removeItem(atPath: lockPath) }
+
+log("mkill: armed — click a window or Dock icon to kill its app; right-click or Esc to cancel.")
+
+let mouseMask = CGEventMask(1 << CGEventType.leftMouseDown.rawValue)
+              | CGEventMask(1 << CGEventType.rightMouseDown.rawValue)
+guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap,
+                                  place: .headInsertEventTap,
+                                  options: .defaultTap,
+                                  eventsOfInterest: mouseMask,
+                                  callback: mouseTapCallback,
+                                  userInfo: nil) else {
+    log("mkill: failed to create the event tap.")
+    exit(1)
+}
+let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+CFRunLoopAddSource(CFRunLoopGetCurrent(), source, CFRunLoopMode.commonModes)
+CGEvent.tapEnable(tap: tap, enable: true)
+
+// Optional: Esc cancels. Needs Input Monitoring permission; degrade silently.
+if let keyTap = CGEvent.tapCreate(tap: .cgSessionEventTap,
+                                  place: .headInsertEventTap,
+                                  options: .defaultTap,
+                                  eventsOfInterest: CGEventMask(1 << CGEventType.keyDown.rawValue),
+                                  callback: keyTapCallback,
+                                  userInfo: nil) {
+    let keySource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, keyTap, 0)
+    CFRunLoopAddSource(CFRunLoopGetCurrent(), keySource, CFRunLoopMode.commonModes)
+    CGEvent.tapEnable(tap: keyTap, enable: true)
+}
+
+CFRunLoopRun()
