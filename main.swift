@@ -16,6 +16,16 @@ import Cocoa
 import ApplicationServices
 import Carbon.HIToolbox
 
+// MARK: - Tuning
+
+private let menuBarHeight: CGFloat = 30   // menu bar strip height (pt)
+private let dockZoneHeight: CGFloat = 170 // dock strip height (pt)
+private let axWalkDepth = 12          // max parent hops to the owning app
+private let dockResolveAttempts = 4   // dock geometry reads before giving up
+private let dockReadRetryDelay = 0.12 // s between dock geometry reads
+private let quitPollInterval = 0.2    // s between termination checks
+private let gracefulQuitTimeout = 6.0 // s before force-killing
+
 // MARK: - Small helpers
 
 private func log(_ s: String) {
@@ -51,7 +61,7 @@ private func axFrame(_ element: AXUIElement) -> CGRect? {
 private func resolveApp(from element: AXUIElement) -> (app: AXUIElement, sawWindow: Bool)? {
     var current: AXUIElement? = element
     var sawWindow = false
-    for _ in 0..<12 {
+    for _ in 0..<axWalkDepth {
         guard let cur = current else { return nil }
         let role = axRole(cur)
         if role == kAXApplicationRole as String { return (cur, sawWindow) }
@@ -114,7 +124,7 @@ private func dockItem(at point: CGPoint, among items: [AXUIElement]) -> AXUIElem
 private func inDockZone(_ p: CGPoint) -> Bool {
     let b = CGDisplayBounds(CGMainDisplayID())
     return p.x >= b.minX && p.x <= b.maxX
-        && p.y >= b.maxY - 170 && p.y <= b.maxY
+        && p.y >= b.maxY - dockZoneHeight && p.y <= b.maxY
 }
 
 private var dockVisible: Bool {
@@ -124,7 +134,7 @@ private var dockVisible: Bool {
 /// Is the point in the menu bar strip (top of the primary display)?
 private func inMenuBarStrip(_ p: CGPoint) -> Bool {
     let b = CGDisplayBounds(CGMainDisplayID())
-    return p.x >= b.minX && p.x <= b.maxX && p.y >= b.minY && p.y <= b.minY + 30
+    return p.x >= b.minX && p.x <= b.maxX && p.y >= b.minY && p.y <= b.minY + menuBarHeight
 }
 
 /// Menu bar extras that are system components, not apps — clicking their
@@ -141,7 +151,7 @@ private func isSystemMenuBarOwner(_ pid: pid_t) -> Bool {
 /// icon that was there when the user clicked. Returns nil if the Dock's tree
 /// stays unreadable or the two signals keep disagreeing.
 private func resolveDockItem(at point: CGPoint) -> AXUIElement? {
-    for _ in 0..<4 {
+    for _ in 0..<dockResolveAttempts {
         let items = dockItemElements()
         let frameHit = dockItem(at: point, among: items)
 
@@ -155,14 +165,14 @@ private func resolveDockItem(at point: CGPoint) -> AXUIElement? {
         } else if let resolved = frameHit ?? hitItem {
             return resolved
         }
-        usleep(120_000) // transient read failure — retry with fresher geometry
+        Thread.sleep(forTimeInterval: dockReadRetryDelay) // transient read failure — retry with fresher geometry
     }
     return nil
 }
 
 /// Kill the app behind the Dock icon under the cursor, or exit cleanly if the
 /// icon is not a running app or the Dock layout is unstable.
-private func killDockItem(at point: CGPoint) -> Never {
+private func handleDockClick(at point: CGPoint) -> Never {
     guard let item = resolveDockItem(at: point) else {
         log("mkill: could not identify the dock app under the cursor (dock in flux?) — nothing killed.")
         exit(1)
@@ -222,12 +232,13 @@ private func killApp(pid: pid_t, name: String) -> Never {
         exit(0)
     }
     app.terminate() // graceful quit; lets the app save its state
-    for _ in 0..<30 { // wait up to 6 s, then force
+    let deadline = Date().addingTimeInterval(gracefulQuitTimeout)
+    while Date() < deadline {
         if app.isTerminated {
             log("mkill: \(name) terminated.")
             exit(0)
         }
-        usleep(200_000)
+        Thread.sleep(forTimeInterval: quitPollInterval)
     }
     log("mkill: \(name) did not quit in time; forcing…")
     app.forceTerminate()
@@ -236,17 +247,20 @@ private func killApp(pid: pid_t, name: String) -> Never {
 
 // MARK: - Click handling
 
-private func handleClick(at eventPoint: CGPoint, isRightClick: Bool) {
-    if isRightClick {
-        log("mkill: cancelled.")
-        exit(0)
-    }
+/// What a click resolved to: a Dock icon to resolve further, an app to kill,
+/// a click to refuse (with a reason), or nothing clickable.
+private enum ClickTarget {
+    case dock(point: CGPoint)
+    case app(pid: pid_t)
+    case refuse(String)
+    case nothing
+}
 
+/// Classify the click: accessibility hit test, then the Dock zone, menu bar
+/// strip, and desktop guards. No side effects — the caller acts on the result.
+private func resolveClickTarget(at eventPoint: CGPoint) -> ClickTarget {
     // CGEvent locations and accessibility coordinates share the global display
     // coordinate space (origin at the top-left of the main display).
-
-    // 1) Accessibility hit test — the Dock's own hit testing decides whether
-    //    the click is on an icon, the dock bar, a window, or the menu bar.
     let systemWide = AXUIElementCreateSystemWide()
     var hit: AXUIElement?
     var hitIsItem = false
@@ -261,48 +275,60 @@ private func handleClick(at eventPoint: CGPoint, isRightClick: Bool) {
         }
     }
 
-    // 2) Dock click: the hit test says Dock, or the point lies in the Dock's
-    //    geometric zone on the primary display. The zone is tree-independent,
-    //    so a click during a Dock reflow (when its accessibility tree may be
-    //    transiently unreadable) can never fall through to the window path and
-    //    kill the app whose window runs underneath the Dock bar.
+    // Dock click: the hit test says Dock, or the point lies in the Dock's
+    // geometric zone on the primary display. The zone is tree-independent, so
+    // a click during a Dock reflow (when its accessibility tree may be
+    // transiently unreadable) never falls through to the window path and kills
+    // the app whose window runs underneath the Dock bar.
     if hitIsItem || hitPID == dockPID || (dockVisible && inDockZone(eventPoint)) {
-        killDockItem(at: eventPoint)
+        return .dock(point: eventPoint)
     }
 
-    // 2.5) Menu bar: the top strip hosts app menus and status items. When the
-    //    hit test fails there (dead spots between status items), never fall
-    //    through to the window path — it would kill the window underneath the
-    //    menu bar.
+    // Menu bar: when the hit test fails in the top strip (dead spots between
+    // status items), never fall through to the window path — it would kill the
+    // window underneath the menu bar.
     if hitPID == 0 && inMenuBarStrip(eventPoint) {
-        log("mkill: clicked the menu bar — nothing killed.")
-        exit(1)
+        return .refuse("mkill: clicked the menu bar — nothing killed.")
     }
 
-    // 3) Window / menu bar / desktop click.
+    // Window / menu bar / desktop click.
     if hitPID != 0 {
         if isSystemMenuBarOwner(hitPID) {
-            log("mkill: clicked a system menu bar item — nothing killed.")
-            exit(1)
+            return .refuse("mkill: clicked a system menu bar item — nothing killed.")
         }
         if hitPID == finderPID && !sawWindow {
-            log("mkill: clicked the desktop — nothing killed.")
-            exit(1)
+            return .refuse("mkill: clicked the desktop — nothing killed.")
         }
-        let name = NSRunningApplication(processIdentifier: hitPID)?.localizedName ?? "pid \(hitPID)"
-        killApp(pid: hitPID, name: name)
+        return .app(pid: hitPID)
     }
 
-    // 4) Fallback: top-most window under the cursor, for apps that do not
-    //    expose accessibility. Dock clicks never reach this point: a window
-    //    whose frame runs underneath the dock bar must not win a dock click.
+    // Fallback: top-most window under the cursor, for apps that do not expose
+    // accessibility.
     if let pid = windowOwnerPID(at: eventPoint) {
+        return .app(pid: pid)
+    }
+
+    return .nothing
+}
+
+private func handleClick(at eventPoint: CGPoint, isRightClick: Bool) {
+    if isRightClick {
+        log("mkill: cancelled.")
+        exit(0)
+    }
+    switch resolveClickTarget(at: eventPoint) {
+    case .dock(let point):
+        handleDockClick(at: point)
+    case .app(let pid):
         let name = NSRunningApplication(processIdentifier: pid)?.localizedName ?? "pid \(pid)"
         killApp(pid: pid, name: name)
+    case .refuse(let message):
+        log(message)
+        exit(1)
+    case .nothing:
+        log("mkill: nothing found under the cursor — nothing killed.")
+        exit(1)
     }
-
-    log("mkill: nothing found under the cursor — nothing killed.")
-    exit(1)
 }
 
 // MARK: - Event taps
