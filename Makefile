@@ -1,16 +1,16 @@
 PREFIX ?= /usr/local
 SWIFTC ?= swiftc
 
-all: mkill
+all: kilx
 
-mkill: main.swift
-	$(SWIFTC) -O main.swift -o mkill
+kilx: main.swift
+	$(SWIFTC) -O main.swift -o kilx
 
-install: mkill
+install: kilx
 	install -d $(PREFIX)/bin
-	install -m 755 mkill $(PREFIX)/bin/mkill
+	install -m 755 kilx $(PREFIX)/bin/kilx
 
 clean:
-	rm -f mkill
+	rm -f kilx
 
 .PHONY: all install clean

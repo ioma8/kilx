@@ -1,4 +1,4 @@
-# mkill
+# kilx
 
 A macOS stand-in for X11's `xkill`: run it, click a window (or Dock icon), and the app that owns it is terminated.
 
@@ -11,14 +11,14 @@ A macOS stand-in for X11's `xkill`: run it, click a window (or Dock icon), and t
 ## Install
 
 ```sh
-make               # builds ./mkill
+make               # builds ./kilx
 sudo make install  # installs to /usr/local/bin
 ```
 
 ## Usage
 
 ```sh
-./mkill
+./kilx
 ```
 
 Then click:

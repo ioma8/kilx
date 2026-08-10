@@ -1,6 +1,6 @@
-// mkill — a macOS stand-in for X11's xkill.
+// kilx — a macOS stand-in for X11's xkill.
 //
-// Usage:  ./mkill          (build with: swiftc -O main.swift -o mkill, or `make`)
+// Usage:  ./kilx          (build with: swiftc -O main.swift -o kilx, or `make`)
 // After arming, click any window, menu bar / status item, or Dock icon to
 // terminate the app that owns it. Right-click or Esc cancels. The click
 // itself is consumed and never reaches the target, just like xkill grabs the
@@ -174,13 +174,13 @@ private func resolveDockItem(at point: CGPoint) -> AXUIElement? {
 /// icon is not a running app or the Dock layout is unstable.
 private func handleDockClick(at point: CGPoint) -> Never {
     guard let item = resolveDockItem(at: point) else {
-        log("mkill: could not identify the dock app under the cursor (dock in flux?) — nothing killed.")
+        log("kilx: could not identify the dock app under the cursor (dock in flux?) — nothing killed.")
         exit(1)
     }
     if let app = appForDockItem(item) {
         killApp(pid: app.processIdentifier, name: app.localizedName ?? "app")
     }
-    log("mkill: dock item \"\(dockItemTitle(item) ?? "?")\" is not a running app (folder/stack/trash?) — nothing killed.")
+    log("kilx: dock item \"\(dockItemTitle(item) ?? "?")\" is not a running app (folder/stack/trash?) — nothing killed.")
     exit(1)
 }
 
@@ -226,21 +226,21 @@ private func windowOwnerPID(at point: CGPoint) -> pid_t? {
 // MARK: - Kill
 
 private func killApp(pid: pid_t, name: String) -> Never {
-    log("mkill: killing \(name) (pid \(pid))")
+    log("kilx: killing \(name) (pid \(pid))")
     guard let app = NSRunningApplication(processIdentifier: pid) else {
-        log("mkill: \(name) is already gone.")
+        log("kilx: \(name) is already gone.")
         exit(0)
     }
     app.terminate() // graceful quit; lets the app save its state
     let deadline = Date().addingTimeInterval(gracefulQuitTimeout)
     while Date() < deadline {
         if app.isTerminated {
-            log("mkill: \(name) terminated.")
+            log("kilx: \(name) terminated.")
             exit(0)
         }
         Thread.sleep(forTimeInterval: quitPollInterval)
     }
-    log("mkill: \(name) did not quit in time; forcing…")
+    log("kilx: \(name) did not quit in time; forcing…")
     app.forceTerminate()
     exit(0)
 }
@@ -288,16 +288,16 @@ private func resolveClickTarget(at eventPoint: CGPoint) -> ClickTarget {
     // status items), never fall through to the window path — it would kill the
     // window underneath the menu bar.
     if hitPID == 0 && inMenuBarStrip(eventPoint) {
-        return .refuse("mkill: clicked the menu bar — nothing killed.")
+        return .refuse("kilx: clicked the menu bar — nothing killed.")
     }
 
     // Window / menu bar / desktop click.
     if hitPID != 0 {
         if isSystemMenuBarOwner(hitPID) {
-            return .refuse("mkill: clicked a system menu bar item — nothing killed.")
+            return .refuse("kilx: clicked a system menu bar item — nothing killed.")
         }
         if hitPID == finderPID && !sawWindow {
-            return .refuse("mkill: clicked the desktop — nothing killed.")
+            return .refuse("kilx: clicked the desktop — nothing killed.")
         }
         return .app(pid: hitPID)
     }
@@ -313,7 +313,7 @@ private func resolveClickTarget(at eventPoint: CGPoint) -> ClickTarget {
 
 private func handleClick(at eventPoint: CGPoint, isRightClick: Bool) {
     if isRightClick {
-        log("mkill: cancelled.")
+        log("kilx: cancelled.")
         exit(0)
     }
     switch resolveClickTarget(at: eventPoint) {
@@ -326,7 +326,7 @@ private func handleClick(at eventPoint: CGPoint, isRightClick: Bool) {
         log(message)
         exit(1)
     case .nothing:
-        log("mkill: nothing found under the cursor — nothing killed.")
+        log("kilx: nothing found under the cursor — nothing killed.")
         exit(1)
     }
 }
@@ -347,7 +347,7 @@ private let mouseTapCallback: CGEventTapCallBack = { _, type, event, _ in
 
 private let keyTapCallback: CGEventTapCallBack = { _, _, event, _ in
     if event.getIntegerValueField(.keyboardEventKeycode) == Int64(kVK_Escape) {
-        log("mkill: cancelled.")
+        log("kilx: cancelled.")
         exit(0)
     }
     return Unmanaged.passUnretained(event)
@@ -359,24 +359,24 @@ let trusted = AXIsProcessTrustedWithOptions(
     [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
 )
 guard trusted else {
-    log("mkill: Accessibility permission required. Grant it to the app you launch this from")
+    log("kilx: Accessibility permission required. Grant it to the app you launch this from")
     log("       (System Settings → Privacy & Security → Accessibility), then run again.")
     exit(1)
 }
 
 // Refuse to run a second armed instance: a stale one left waiting for a click
 // would silently consume the next mouse-down instead of the fresh instance.
-let lockPath = "/tmp/mkill.pid"
+let lockPath = "/tmp/kilx.pid"
 if let existing = try? String(contentsOfFile: lockPath, encoding: .utf8)
     .trimmingCharacters(in: .whitespacesAndNewlines),
    let pid = pid_t(existing), pid != getpid(), Darwin.kill(pid, 0) == 0 {
-    log("mkill: another instance is already armed (pid \(pid)) — use it or kill it, then run again.")
+    log("kilx: another instance is already armed (pid \(pid)) — use it or kill it, then run again.")
     exit(1)
 }
 try? String(getpid()).write(toFile: lockPath, atomically: true, encoding: .utf8)
 atexit { try? FileManager.default.removeItem(atPath: lockPath) }
 
-log("mkill: armed — click a window, menu bar item, or Dock icon to kill its app; right-click or Esc to cancel.")
+log("kilx: armed — click a window, menu bar item, or Dock icon to kill its app; right-click or Esc to cancel.")
 
 let mouseMask = CGEventMask(1 << CGEventType.leftMouseDown.rawValue)
               | CGEventMask(1 << CGEventType.rightMouseDown.rawValue)
@@ -386,7 +386,7 @@ guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap,
                                   eventsOfInterest: mouseMask,
                                   callback: mouseTapCallback,
                                   userInfo: nil) else {
-    log("mkill: failed to create the event tap.")
+    log("kilx: failed to create the event tap.")
     exit(1)
 }
 let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
