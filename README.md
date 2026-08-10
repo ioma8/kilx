@@ -40,14 +40,6 @@ The click itself is consumed and never reaches the target — exactly like `xkil
 - Dock clicks: resolved from the Dock's own icon geometry (never the window underneath the Dock bar) and refused while the Dock layout is unstable.
 - Fallback to the top-most window under the cursor for apps without accessibility support.
 
-## Debug
-
-```sh
-MKILL_DEBUG=1 ./mkill
-```
-
-prints the click position, the resolution decision, and the matched app.
-
 ## License
 
 [MIT](LICENSE)

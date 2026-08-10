@@ -21,12 +21,6 @@ private func log(_ s: String) {
     FileHandle.standardError.write(Data((s + "\n").utf8))
 }
 
-private func dbg(_ s: String) {
-    if ProcessInfo.processInfo.environment["MKILL_DEBUG"] != nil {
-        FileHandle.standardError.write(Data(("mkill: [dbg] " + s + "\n").utf8))
-    }
-}
-
 private let dockItemRole = "AXDockItem"
 
 private func axAttr(_ element: AXUIElement, _ attr: CFString) -> CFTypeRef? {
@@ -100,21 +94,15 @@ private func dockItemTitle(_ item: AXUIElement) -> String? {
 }
 
 /// Item whose frame contains the point, preferring the innermost (smallest)
-/// frame; otherwise the icon whose center is close to the point.
+/// frame.
 private func dockItem(at point: CGPoint, among items: [AXUIElement]) -> AXUIElement? {
     let framed = items.compactMap { item -> (AXUIElement, CGRect)? in
         guard let f = axFrame(item) else { return nil }
         return (item, f)
     }
-    let containing = framed.filter { $0.1.contains(point) }
-    if let best = containing.min(by: { $0.1.width * $0.1.height < $1.1.width * $1.1.height }) {
-        return best.0
-    }
     return framed
-        .filter { hypot($0.1.midX - point.x, $0.1.midY - point.y) <= 70 }
-        .min { a, b in
-            hypot(a.1.midX - point.x, a.1.midY - point.y) < hypot(b.1.midX - point.x, b.1.midY - point.y)
-        }?.0
+        .filter { $0.1.contains(point) }
+        .min { $0.1.width * $0.1.height < $1.1.width * $1.1.height }?.0
 }
 
 /// Is the click point inside the strip the Dock occupies on the primary
@@ -160,14 +148,12 @@ private func resolveDockItem(at point: CGPoint) -> AXUIElement? {
 
 /// Kill the app behind the Dock icon under the cursor, or exit cleanly if the
 /// icon is not a running app or the Dock layout is unstable.
-private func killDockItem(at axPoint: CGPoint) -> Never {
-    guard let item = resolveDockItem(at: axPoint) else {
+private func killDockItem(at point: CGPoint) -> Never {
+    guard let item = resolveDockItem(at: point) else {
         log("mkill: could not identify the dock app under the cursor (dock in flux?) — nothing killed.")
         exit(1)
     }
-    dbg("resolved dock item [\(dockItemTitle(item) ?? "?")]")
     if let app = appForDockItem(item) {
-        dbg("matched running app [\(app.localizedName ?? "?")] pid \(app.processIdentifier)")
         killApp(pid: app.processIdentifier, name: app.localizedName ?? "app")
     }
     log("mkill: dock item \"\(dockItemTitle(item) ?? "?")\" is not a running app (folder/stack/trash?) — nothing killed.")
@@ -190,10 +176,8 @@ private func runningApp(named name: String) -> NSRunningApplication? {
 }
 
 private func appForDockItem(_ item: AXUIElement) -> NSRunningApplication? {
-    if let title = dockItemTitle(item), let app = runningApp(named: title) { return app }
-    if let desc = axAttr(item, kAXDescriptionAttribute as CFString) as? String,
-       let app = runningApp(named: desc) { return app }
-    return nil
+    guard let title = dockItemTitle(item) else { return nil }
+    return runningApp(named: title)
 }
 
 // MARK: - Fallback: top-most window under the cursor
@@ -219,23 +203,20 @@ private func windowOwnerPID(at point: CGPoint) -> pid_t? {
 
 private func killApp(pid: pid_t, name: String) -> Never {
     log("mkill: killing \(name) (pid \(pid))")
-    if let app = NSRunningApplication(processIdentifier: pid) {
-        app.terminate() // graceful quit; lets the app save its state
-        for _ in 0..<30 { // wait up to 6 s, then force
-            if app.isTerminated {
-                log("mkill: \(name) terminated.")
-                exit(0)
-            }
-            usleep(200_000)
-        }
-        log("mkill: \(name) did not quit in time; forcing…")
-        app.forceTerminate()
+    guard let app = NSRunningApplication(processIdentifier: pid) else {
+        log("mkill: \(name) is already gone.")
         exit(0)
     }
-    guard Darwin.kill(pid, SIGKILL) == 0 else {
-        log("mkill: could not terminate pid \(pid) (errno \(errno)).")
-        exit(1)
+    app.terminate() // graceful quit; lets the app save its state
+    for _ in 0..<30 { // wait up to 6 s, then force
+        if app.isTerminated {
+            log("mkill: \(name) terminated.")
+            exit(0)
+        }
+        usleep(200_000)
     }
+    log("mkill: \(name) did not quit in time; forcing…")
+    app.forceTerminate()
     exit(0)
 }
 
@@ -248,10 +229,7 @@ private func handleClick(at eventPoint: CGPoint, isRightClick: Bool) {
     }
 
     // CGEvent locations and accessibility coordinates share the global display
-    // coordinate space (origin at the top-left of the main display), so the
-    // click point is used as-is. Flipping it here mirrored every real click
-    // vertically — dock clicks resolved on the menu bar of the frontmost app.
-    let axPoint = eventPoint
+    // coordinate space (origin at the top-left of the main display).
 
     // 1) Accessibility hit test — the Dock's own hit testing decides whether
     //    the click is on an icon, the dock bar, a window, or the menu bar.
@@ -260,7 +238,7 @@ private func handleClick(at eventPoint: CGPoint, isRightClick: Bool) {
     var hitIsItem = false
     var hitPID: pid_t = 0
     var sawWindow = false
-    if AXUIElementCopyElementAtPosition(systemWide, Float(axPoint.x), Float(axPoint.y), &hit) == .success,
+    if AXUIElementCopyElementAtPosition(systemWide, Float(eventPoint.x), Float(eventPoint.y), &hit) == .success,
        let hit {
         hitIsItem = axRole(hit) == dockItemRole
         if let resolved = resolveApp(from: hit) {
@@ -274,9 +252,8 @@ private func handleClick(at eventPoint: CGPoint, isRightClick: Bool) {
     //    so a click during a Dock reflow (when its accessibility tree may be
     //    transiently unreadable) can never fall through to the window path and
     //    kill the app whose window runs underneath the Dock bar.
-    dbg("click \(eventPoint) ax \(axPoint) hitIsItem=\(hitIsItem) hitPID=\(hitPID) dockZone=\(inDockZone(eventPoint)) dockVisible=\(dockVisible)")
     if hitIsItem || hitPID == dockPID || (dockVisible && inDockZone(eventPoint)) {
-        killDockItem(at: axPoint)
+        killDockItem(at: eventPoint)
     }
 
     // 3) Window / menu bar / desktop click.
