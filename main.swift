@@ -1,11 +1,12 @@
 // mkill — a macOS stand-in for X11's xkill.
 //
 // Usage:  ./mkill          (build with: swiftc -O main.swift -o mkill, or `make`)
-// After arming, click any window (or Dock icon) to terminate the app that
-// owns it. Right-click or Esc cancels. The click itself is consumed and never
-// reaches the target, just like xkill grabs the pointer. One click per run:
-// the tool exits after the first mouse-down whether or not it killed
-// anything, so a stray click can never take down a second app.
+// After arming, click any window, menu bar / status item, or Dock icon to
+// terminate the app that owns it. Right-click or Esc cancels. The click
+// itself is consumed and never reaches the target, just like xkill grabs the
+// pointer. One click per run: the tool exits after the first mouse-down
+// whether or not it killed anything, so a stray click can never take down a
+// second app.
 //
 // Requires Accessibility permission for the app you launch it from
 // (System Settings → Privacy & Security → Accessibility). Esc additionally
@@ -118,6 +119,21 @@ private func inDockZone(_ p: CGPoint) -> Bool {
 
 private var dockVisible: Bool {
     UserDefaults(suiteName: "com.apple.dock")?.bool(forKey: "autohide") != true
+}
+
+/// Is the point in the menu bar strip (top of the primary display)?
+private func inMenuBarStrip(_ p: CGPoint) -> Bool {
+    let b = CGDisplayBounds(CGMainDisplayID())
+    return p.x >= b.minX && p.x <= b.maxX && p.y >= b.minY && p.y <= b.minY + 30
+}
+
+/// Menu bar extras that are system components, not apps — clicking their
+/// icons should never kill them.
+private func isSystemMenuBarOwner(_ pid: pid_t) -> Bool {
+    guard let bundle = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier else { return false }
+    return bundle == "com.apple.controlcenter"
+        || bundle == "com.apple.spotlight"
+        || bundle == "com.apple.systemuiserver"
 }
 
 /// Resolve the Dock item under the cursor from the earliest consistent read:
@@ -256,8 +272,21 @@ private func handleClick(at eventPoint: CGPoint, isRightClick: Bool) {
         killDockItem(at: eventPoint)
     }
 
+    // 2.5) Menu bar: the top strip hosts app menus and status items. When the
+    //    hit test fails there (dead spots between status items), never fall
+    //    through to the window path — it would kill the window underneath the
+    //    menu bar.
+    if hitPID == 0 && inMenuBarStrip(eventPoint) {
+        log("mkill: clicked the menu bar — nothing killed.")
+        exit(1)
+    }
+
     // 3) Window / menu bar / desktop click.
     if hitPID != 0 {
+        if isSystemMenuBarOwner(hitPID) {
+            log("mkill: clicked a system menu bar item — nothing killed.")
+            exit(1)
+        }
         if hitPID == finderPID && !sawWindow {
             log("mkill: clicked the desktop — nothing killed.")
             exit(1)
@@ -323,7 +352,7 @@ if let existing = try? String(contentsOfFile: lockPath, encoding: .utf8)
 try? String(getpid()).write(toFile: lockPath, atomically: true, encoding: .utf8)
 atexit { try? FileManager.default.removeItem(atPath: lockPath) }
 
-log("mkill: armed — click a window or Dock icon to kill its app; right-click or Esc to cancel.")
+log("mkill: armed — click a window, menu bar item, or Dock icon to kill its app; right-click or Esc to cancel.")
 
 let mouseMask = CGEventMask(1 << CGEventType.leftMouseDown.rawValue)
               | CGEventMask(1 << CGEventType.rightMouseDown.rawValue)

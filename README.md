@@ -25,7 +25,7 @@ Then click:
 
 | you click | result |
 |---|---|
-| a window / menu bar | the owning app quits (graceful, force after 6 s) |
+| a window / menu bar / status item | the owning app quits (graceful, force after 6 s); system status items (Control Center, Spotlight) are ignored |
 | a running app's Dock icon | that app quits |
 | a non-running app's icon, folder, stack, Trash | nothing killed (exit 1) |
 | the desktop | nothing killed (exit 1) |
