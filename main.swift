@@ -131,9 +131,7 @@ private func inMenuBarStrip(_ p: CGPoint) -> Bool {
 /// icons should never kill them.
 private func isSystemMenuBarOwner(_ pid: pid_t) -> Bool {
     guard let bundle = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier else { return false }
-    return bundle == "com.apple.controlcenter"
-        || bundle == "com.apple.spotlight"
-        || bundle == "com.apple.systemuiserver"
+    return ["com.apple.controlcenter", "com.apple.spotlight", "com.apple.systemuiserver"].contains(bundle)
 }
 
 /// Resolve the Dock item under the cursor from the earliest consistent read:
